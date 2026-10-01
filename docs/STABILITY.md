@@ -1,5 +1,10 @@
 # Stability fixes and verification
 
+This document describes the initial render/diagnostics patch. The later
+JNI initialization changes and their compatibility limits are documented in
+[JNI_CRASH.md](JNI_CRASH.md); that follow-up supersedes the JNI `Send`/`Sync`
+and JNI recovery concerns listed below.
+
 ## Scope
 
 These changes address observable code-level crash risks and frame-copy overhead.

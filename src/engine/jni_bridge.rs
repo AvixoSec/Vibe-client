@@ -1,12 +1,9 @@
 #![allow(non_snake_case, non_camel_case_types, dead_code, clippy::missing_safety_doc)]
 
-//! Astraea-aware JNI bridge for the Vibe Client.
-//!
-//! Provides crash-proof JNI calls through a VEH gate, Astraea stub
-//! unwrapping, PE-scan fallback for unlinked jvm.dll, and full
-//! game-state reading from MCP 1.12.2 obfuscated classes.
+//! Standard JNI bridge for the Vibe Client.
+//! Uses JVM-provided function pointers; unsupported initialization fails closed.
 
-use std::ffi::{c_char, c_void, CStr, CString};
+use std::ffi::{c_char, c_void, CString};
 use std::ptr;
 
 use crate::core::snapshot::*;
@@ -15,50 +12,7 @@ use crate::core::snapshot::*;
 // JNI Type Aliases
 // ══════════════════════════════════════════════════════════════════════
 
-pub type Jint = i32;
-pub type Jsize = i32;
-pub type Jboolean = u8;
-pub type Jlong = i64;
-pub type Jfloat = f32;
-pub type Jdouble = f64;
-pub type Jobject = *mut c_void;
-pub type Jclass = Jobject;
-pub type JmethodID = *mut c_void;
-pub type JfieldID = *mut c_void;
-pub type Jstring = Jobject;
-pub type Jarray = Jobject;
-
-pub type JavaVM = *mut *const JNIInvokeInterface;
-pub type JNIEnv = *mut *const c_void;
-
-pub const JNI_OK: Jint = 0;
-pub const JNI_VERSION_1_8: Jint = 0x00010008;
-
-#[repr(C)]
-pub struct JNIInvokeInterface {
-    pub reserved0: *mut c_void,
-    pub reserved1: *mut c_void,
-    pub reserved2: *mut c_void,
-    pub destroy_java_vm: unsafe extern "system" fn(JavaVM) -> Jint,
-    pub attach_current_thread: unsafe extern "system" fn(JavaVM, *mut *mut c_void, *mut c_void) -> Jint,
-    pub detach_current_thread: unsafe extern "system" fn(JavaVM) -> Jint,
-    pub get_env: unsafe extern "system" fn(JavaVM, *mut *mut c_void, Jint) -> Jint,
-    pub attach_current_thread_as_daemon: unsafe extern "system" fn(JavaVM, *mut *mut c_void, *mut c_void) -> Jint,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub union jvalue {
-    pub z: Jboolean,
-    pub b: i8,
-    pub c: u16,
-    pub s: i16,
-    pub i: Jint,
-    pub j: Jlong,
-    pub f: Jfloat,
-    pub d: Jdouble,
-    pub l: Jobject,
-}
+pub use crate::engine::jni_api::*;
 
 #[repr(C)]
 struct JavaVMAttachArgs {
@@ -68,88 +22,15 @@ struct JavaVMAttachArgs {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// JNI Function Table Offsets
-// ══════════════════════════════════════════════════════════════════════
-
-const JNI_GET_VERSION: usize = 4;
-const JNI_FIND_CLASS: usize = 6;
-const JNI_FROM_REFLECTED_METHOD: usize = 7;
-const JNI_FROM_REFLECTED_FIELD: usize = 8;
-const JNI_EXCEPTION_OCCURRED: usize = 15;
-const JNI_EXCEPTION_CLEAR: usize = 17;
-const JNI_PUSH_LOCAL_FRAME: usize = 19;
-const JNI_POP_LOCAL_FRAME: usize = 20;
-const JNI_NEW_GLOBAL_REF: usize = 21;
-const JNI_DELETE_GLOBAL_REF: usize = 22;
-const JNI_DELETE_LOCAL_REF: usize = 23;
-const JNI_IS_SAME_OBJECT: usize = 24;
-const JNI_GET_OBJECT_CLASS: usize = 31;
-const JNI_GET_METHOD_ID: usize = 33;
-const JNI_CALL_OBJECT_METHOD_A: usize = 36;
-const JNI_CALL_BOOLEAN_METHOD_A: usize = 39;
-const JNI_CALL_INT_METHOD_A: usize = 51;
-const JNI_CALL_LONG_METHOD_A: usize = 54;
-const JNI_CALL_FLOAT_METHOD_A: usize = 57;
-const JNI_CALL_DOUBLE_METHOD_A: usize = 60;
-const JNI_CALL_VOID_METHOD_A: usize = 63;
-const JNI_GET_FIELD_ID: usize = 94;
-const JNI_GET_OBJECT_FIELD: usize = 95;
-const JNI_GET_BOOLEAN_FIELD: usize = 96;
-const JNI_GET_INT_FIELD: usize = 100;
-const JNI_GET_FLOAT_FIELD: usize = 102;
-const JNI_GET_DOUBLE_FIELD: usize = 103;
-const JNI_SET_BOOLEAN_FIELD: usize = 105;
-const JNI_SET_INT_FIELD: usize = 109;
-const JNI_SET_FLOAT_FIELD: usize = 111;
-const JNI_SET_DOUBLE_FIELD: usize = 112;
-const JNI_GET_STATIC_METHOD_ID: usize = 113;
-const JNI_CALL_STATIC_OBJECT_METHOD_A: usize = 116;
-const JNI_CALL_STATIC_BOOLEAN_METHOD_A: usize = 119;
-const JNI_CALL_STATIC_INT_METHOD_A: usize = 122;
-const JNI_CALL_STATIC_VOID_METHOD_A: usize = 143;
-const JNI_GET_STATIC_FIELD_ID: usize = 144;
-const JNI_GET_STATIC_OBJECT_FIELD: usize = 145;
-const JNI_NEW_STRING_UTF: usize = 167;
-const JNI_GET_STRING_UTF_CHARS: usize = 169;
-const JNI_RELEASE_STRING_UTF_CHARS: usize = 170;
-const JNI_GET_ARRAY_LENGTH: usize = 171;
-const JNI_NEW_OBJECT_ARRAY: usize = 172;
-const JNI_GET_OBJECT_ARRAY_ELEMENT: usize = 173;
-const JNI_EXCEPTION_CHECK: usize = 228;
-
-// ══════════════════════════════════════════════════════════════════════
 // VEH Crash-Proof Gate
 // ══════════════════════════════════════════════════════════════════════
 
-pub static mut G_GUARD_ON: bool = false;
-pub static mut G_GUARD_THREAD_ID: u32 = 0;
 pub static mut G_RENDER_GUARD: bool = false;
 pub static mut G_RENDER_RSP: usize = 0;
 pub static mut G_RENDER_CALSAVE: [usize; 8] = [0; 8];
 pub static mut G_RENDER_TID: u32 = 0;
 pub static mut G_RENDER_FAULTED: bool = false;
-static mut G_GUARD_RSP: usize = 0;
-static mut G_GUARD_FAULTED: bool = false;
-static mut G_CALSAVE: [usize; 8] = [0; 8];
-static mut G_JVM_BASE: usize = 0;
-static mut G_JVM_SIZE: usize = 0;
 static mut G_VEH_INSTALLED: bool = false;
-
-#[inline(always)]
-unsafe fn save_calsave() {
-    let (rbx, rbp, rdi, rsi, r12, r13, r14, r15): (usize, usize, usize, usize, usize, usize, usize, usize);
-    core::arch::asm!(
-        "mov {0}, rbx", "mov {1}, rbp", "mov {2}, rdi", "mov {3}, rsi",
-        "mov {4}, r12", "mov {5}, r13", "mov {6}, r14", "mov {7}, r15",
-        out(reg) rbx, out(reg) rbp, out(reg) rdi, out(reg) rsi,
-        out(reg) r12, out(reg) r13, out(reg) r14, out(reg) r15,
-        options(nostack)
-    );
-    G_CALSAVE = [rbx, rbp, rdi, rsi, r12, r13, r14, r15];
-}
-
-#[no_mangle]
-extern "C" fn vibe_guard_abort() -> u64 { 0 }
 
 #[no_mangle]
 pub extern "C" fn render_abort() -> u64 { 0 }
@@ -180,98 +61,6 @@ fn cur_rsp() -> usize {
     let r: usize;
     unsafe { core::arch::asm!("mov {}, rsp", out(reg) r, options(nomem, nostack, preserves_flags)) };
     r
-}
-
-unsafe fn guarded1<R: Copy>(f: usize, a0: usize) -> Option<R> {
-    save_calsave();
-    G_GUARD_RSP = cur_rsp();
-    G_GUARD_FAULTED = false;
-    G_GUARD_THREAD_ID = GetCurrentThreadId();
-    G_GUARD_ON = true;
-    let fp: extern "C" fn(usize) -> R = std::mem::transmute(f);
-    let r = fp(a0);
-    G_GUARD_ON = false;
-    if G_GUARD_FAULTED { None } else { Some(r) }
-}
-
-unsafe fn guarded2<R: Copy>(f: usize, a0: usize, a1: usize) -> Option<R> {
-    save_calsave();
-    G_GUARD_RSP = cur_rsp();
-    G_GUARD_FAULTED = false;
-    G_GUARD_THREAD_ID = GetCurrentThreadId();
-    G_GUARD_ON = true;
-    let fp: extern "C" fn(usize, usize) -> R = std::mem::transmute(f);
-    let r = fp(a0, a1);
-    G_GUARD_ON = false;
-    if G_GUARD_FAULTED { None } else { Some(r) }
-}
-
-unsafe fn guarded3<R: Copy>(f: usize, a0: usize, a1: usize, a2: usize) -> Option<R> {
-    save_calsave();
-    G_GUARD_RSP = cur_rsp();
-    G_GUARD_FAULTED = false;
-    G_GUARD_THREAD_ID = GetCurrentThreadId();
-    G_GUARD_ON = true;
-    let fp: extern "C" fn(usize, usize, usize) -> R = std::mem::transmute(f);
-    let r = fp(a0, a1, a2);
-    G_GUARD_ON = false;
-    if G_GUARD_FAULTED { None } else { Some(r) }
-}
-
-unsafe fn guarded4<R: Copy>(f: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> Option<R> {
-    save_calsave();
-    G_GUARD_RSP = cur_rsp();
-    G_GUARD_FAULTED = false;
-    G_GUARD_THREAD_ID = GetCurrentThreadId();
-    G_GUARD_ON = true;
-    let fp: extern "C" fn(usize, usize, usize, usize) -> R = std::mem::transmute(f);
-    let r = fp(a0, a1, a2, a3);
-    G_GUARD_ON = false;
-    if G_GUARD_FAULTED { None } else { Some(r) }
-}
-
-macro_rules! jni_raw {
-    ($env:expr, $offset:expr) => {{
-        let table = *$env;
-        *(table as *const *const c_void).add($offset) as usize
-    }};
-}
-
-/// Unwrap Astraea gate stub: if vtable entry points outside jvm.dll,
-/// scan the stub body for `49 BA <imm64> 41 FF E2` (movabs r10, addr; jmp r10)
-/// and recover the original function inside jvm.dll.
-unsafe fn effective_fn(env: JNIEnv, slot: usize) -> usize {
-    let cur = jni_raw!(env, slot);
-    let (base, size) = (G_JVM_BASE, G_JVM_SIZE);
-    if base == 0 || size == 0 || (cur >= base && cur < base.wrapping_add(size)) {
-        return cur;
-    }
-    let mut b = [0u8; 128];
-    if !read_mem_safe(cur, &mut b) { return cur; }
-    let mut i = 0usize;
-    while i + 13 <= b.len() {
-        if b[i] == 0x49 && b[i + 1] == 0xBA {
-            let t = u64::from_le_bytes(b[i + 2..i + 10].try_into().unwrap()) as usize;
-            if b[i + 10] == 0x41 && b[i + 11] == 0xFF && b[i + 12] == 0xE2 {
-                if t >= base && t < base.wrapping_add(size) {
-                    return t;
-                }
-            }
-        }
-        i += 1;
-    }
-    cur
-}
-
-unsafe fn read_mem_safe(addr: usize, buf: &mut [u8]) -> bool {
-    save_calsave();
-    G_GUARD_RSP = cur_rsp();
-    G_GUARD_FAULTED = false;
-    G_GUARD_THREAD_ID = GetCurrentThreadId();
-    G_GUARD_ON = true;
-    std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), buf.len());
-    G_GUARD_ON = false;
-    !G_GUARD_FAULTED
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -343,33 +132,6 @@ unsafe extern "system" fn veh_crash_handler(info: *mut EXCEPTION_POINTERS) -> i3
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
 
-    // 2. Guard JNI calls: ONLY on our specific cheat worker thread!
-    if G_GUARD_ON && cur_tid == G_GUARD_THREAD_ID {
-        let ex_addr = (*(*info).ExceptionRecord).ExceptionAddress as usize;
-        let (base, size) = (G_JVM_BASE, G_JVM_SIZE);
-        // If exception is inside jvm.dll, HotSpot MUST handle its own implicit null checks / safepoints!
-        if base != 0 && size != 0 && ex_addr >= base && ex_addr < base.wrapping_add(size) {
-            return 0; // EXCEPTION_CONTINUE_SEARCH -> let HotSpot handle it!
-        }
-        G_GUARD_ON = false;
-        G_GUARD_FAULTED = true;
-        let code = (*(*info).ExceptionRecord).ExceptionCode;
-        log_msg(&format!(
-            "[JNI-VEH] Caught hardware exception 0x{:08X} at 0x{:X} outside JVM, recovering thread!",
-            code, ex_addr
-        ));
-        let ctx = &mut *(*info).ContextRecord.cast::<CONTEXT>();
-        ctx.rip = vibe_guard_abort as *const () as usize as u64;
-        ctx.rsp = G_GUARD_RSP.wrapping_sub(8) as u64;
-        ctx.rax = 0;
-        let s = G_CALSAVE;
-        ctx.rbx = s[0] as u64; ctx.rbp = s[1] as u64;
-        ctx.rdi = s[2] as u64; ctx.rsi = s[3] as u64;
-        ctx.r12 = s[4] as u64; ctx.r13 = s[5] as u64;
-        ctx.r14 = s[6] as u64; ctx.r15 = s[7] as u64;
-        return -1; // EXCEPTION_CONTINUE_EXECUTION
-    }
-
     // 3. For any other thread (e.g. JVM internal implicit null checks, GC, JIT):
     // MUST pass through to JVM's own exception handler!
     0 // EXCEPTION_CONTINUE_SEARCH
@@ -386,406 +148,18 @@ pub unsafe fn install_veh() {
 // JNI Helper Functions
 // ══════════════════════════════════════════════════════════════════════
 
-unsafe fn jni_clear_exception(env: JNIEnv) -> bool {
-    let f_check = effective_fn(env, JNI_EXCEPTION_CHECK);
-    let had = guarded1::<Jboolean>(f_check, env as usize).unwrap_or(0) != 0;
-    if had {
-        let f_clear = effective_fn(env, JNI_EXCEPTION_CLEAR);
-        let _ = guarded1::<()>(f_clear, env as usize);
-    }
-    had
-}
-
-pub unsafe fn jni_find_class(env: JNIEnv, name: &str) -> Jclass {
-    let cname = match CString::new(name) { Ok(c) => c, Err(_) => return ptr::null_mut() };
-    let f = effective_fn(env, JNI_FIND_CLASS);
-    let res = guarded2::<Jclass>(f, env as usize, cname.as_ptr() as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env);
-    res
-}
-
-pub unsafe fn jni_get_method_id(env: JNIEnv, cls: Jclass, name: &str, sig: &str) -> JmethodID {
-    if cls.is_null() { return ptr::null_mut(); }
-    let cn = CString::new(name).unwrap(); let cs = CString::new(sig).unwrap();
-    let f = effective_fn(env, JNI_GET_METHOD_ID);
-    let r = guarded4::<JmethodID>(f, env as usize, cls as usize, cn.as_ptr() as usize, cs.as_ptr() as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_static_method_id(env: JNIEnv, cls: Jclass, name: &str, sig: &str) -> JmethodID {
-    if cls.is_null() { return ptr::null_mut(); }
-    let cn = CString::new(name).unwrap(); let cs = CString::new(sig).unwrap();
-    let f = effective_fn(env, JNI_GET_STATIC_METHOD_ID);
-    let r = guarded4::<JmethodID>(f, env as usize, cls as usize, cn.as_ptr() as usize, cs.as_ptr() as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_field_id(env: JNIEnv, cls: Jclass, name: &str, sig: &str) -> JfieldID {
-    if cls.is_null() { return ptr::null_mut(); }
-    let cn = match CString::new(name) { Ok(c) => c, Err(_) => return ptr::null_mut() };
-    let cs = match CString::new(sig) { Ok(c) => c, Err(_) => return ptr::null_mut() };
-    let f = effective_fn(env, JNI_GET_FIELD_ID);
-    let r = guarded4::<JfieldID>(f, env as usize, cls as usize, cn.as_ptr() as usize, cs.as_ptr() as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_static_field_id(env: JNIEnv, cls: Jclass, name: &str, sig: &str) -> JfieldID {
-    if cls.is_null() { return ptr::null_mut(); }
-    let cn = match CString::new(name) { Ok(c) => c, Err(_) => return ptr::null_mut() };
-    let cs = match CString::new(sig) { Ok(c) => c, Err(_) => return ptr::null_mut() };
-    let f = effective_fn(env, JNI_GET_STATIC_FIELD_ID);
-    let r = guarded4::<JfieldID>(f, env as usize, cls as usize, cn.as_ptr() as usize, cs.as_ptr() as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_object_field(env: JNIEnv, obj: Jobject, fid: JfieldID) -> Jobject {
-    if obj.is_null() || fid.is_null() { return ptr::null_mut(); }
-    let f = effective_fn(env, JNI_GET_OBJECT_FIELD);
-    let r = guarded3::<Jobject>(f, env as usize, obj as usize, fid as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_double_field(env: JNIEnv, obj: Jobject, fid: JfieldID) -> f64 {
-    if obj.is_null() || fid.is_null() { return 0.0; }
-    let f = effective_fn(env, JNI_GET_DOUBLE_FIELD);
-    let r = guarded3::<f64>(f, env as usize, obj as usize, fid as usize).unwrap_or(0.0);
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_float_field(env: JNIEnv, obj: Jobject, fid: JfieldID) -> f32 {
-    if obj.is_null() || fid.is_null() { return 0.0; }
-    let f = effective_fn(env, JNI_GET_FLOAT_FIELD);
-    let r = guarded3::<f32>(f, env as usize, obj as usize, fid as usize).unwrap_or(0.0);
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_int_field(env: JNIEnv, obj: Jobject, fid: JfieldID) -> Jint {
-    if obj.is_null() || fid.is_null() { return 0; }
-    let f = effective_fn(env, JNI_GET_INT_FIELD);
-    let r = guarded3::<Jint>(f, env as usize, obj as usize, fid as usize).unwrap_or(0);
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_boolean_field(env: JNIEnv, obj: Jobject, fid: JfieldID) -> bool {
-    if obj.is_null() || fid.is_null() { return false; }
-    let f = effective_fn(env, JNI_GET_BOOLEAN_FIELD);
-    let r = guarded3::<Jboolean>(f, env as usize, obj as usize, fid as usize).unwrap_or(0);
-    jni_clear_exception(env); r != 0
-}
-
-pub unsafe fn jni_set_float_field(env: JNIEnv, obj: Jobject, fid: JfieldID, val: f32) {
-    if obj.is_null() || fid.is_null() { return; }
-    let f = effective_fn(env, JNI_SET_FLOAT_FIELD);
-    let _ = guarded4::<()>(f, env as usize, obj as usize, fid as usize, val.to_bits() as usize);
-    jni_clear_exception(env);
-}
-
-pub unsafe fn jni_set_double_field(env: JNIEnv, obj: Jobject, fid: JfieldID, val: f64) {
-    if obj.is_null() || fid.is_null() { return; }
-    let f = effective_fn(env, JNI_SET_DOUBLE_FIELD);
-    let _ = guarded4::<()>(f, env as usize, obj as usize, fid as usize, val.to_bits() as usize);
-    jni_clear_exception(env);
-}
-
-pub unsafe fn jni_set_boolean_field(env: JNIEnv, obj: Jobject, fid: JfieldID, val: bool) {
-    if obj.is_null() || fid.is_null() { return; }
-    let f = effective_fn(env, JNI_SET_BOOLEAN_FIELD);
-    let _ = guarded4::<()>(f, env as usize, obj as usize, fid as usize, val as usize);
-    jni_clear_exception(env);
-}
-
-pub unsafe fn jni_call_object(env: JNIEnv, obj: Jobject, mid: JmethodID, args: &[jvalue]) -> Jobject {
-    if obj.is_null() || mid.is_null() { return ptr::null_mut(); }
-    let f = effective_fn(env, JNI_CALL_OBJECT_METHOD_A);
-    let p = if args.is_empty() { ptr::null() } else { args.as_ptr() };
-    let r = guarded4::<Jobject>(f, env as usize, obj as usize, mid as usize, p as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_call_float(env: JNIEnv, obj: Jobject, mid: JmethodID, args: &[jvalue]) -> f32 {
-    if obj.is_null() || mid.is_null() { return 0.0; }
-    let f = effective_fn(env, JNI_CALL_FLOAT_METHOD_A);
-    let p = if args.is_empty() { ptr::null() } else { args.as_ptr() };
-    let r = guarded4::<f32>(f, env as usize, obj as usize, mid as usize, p as usize).unwrap_or(0.0);
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_call_int(env: JNIEnv, obj: Jobject, mid: JmethodID, args: &[jvalue]) -> Jint {
-    if obj.is_null() || mid.is_null() { return 0; }
-    let f = effective_fn(env, JNI_CALL_INT_METHOD_A);
-    let p = if args.is_empty() { ptr::null() } else { args.as_ptr() };
-    let r = guarded4::<Jint>(f, env as usize, obj as usize, mid as usize, p as usize).unwrap_or(0);
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_call_void(env: JNIEnv, obj: Jobject, mid: JmethodID, args: &[jvalue]) {
-    if obj.is_null() || mid.is_null() { return; }
-    let f = effective_fn(env, JNI_CALL_VOID_METHOD_A);
-    let p = if args.is_empty() { ptr::null() } else { args.as_ptr() };
-    let _ = guarded4::<()>(f, env as usize, obj as usize, mid as usize, p as usize);
-    jni_clear_exception(env);
-}
-
-pub unsafe fn jni_call_static_object(env: JNIEnv, cls: Jclass, mid: JmethodID, args: &[jvalue]) -> Jobject {
-    if cls.is_null() || mid.is_null() { return ptr::null_mut(); }
-    let f = effective_fn(env, JNI_CALL_STATIC_OBJECT_METHOD_A);
-    let p = if args.is_empty() { ptr::null() } else { args.as_ptr() };
-    let r = guarded4::<Jobject>(f, env as usize, cls as usize, mid as usize, p as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_call_static_void(env: JNIEnv, cls: Jclass, mid: JmethodID, args: &[jvalue]) {
-    if cls.is_null() || mid.is_null() { return; }
-    let f = effective_fn(env, JNI_CALL_STATIC_VOID_METHOD_A);
-    let p = if args.is_empty() { ptr::null() } else { args.as_ptr() };
-    let _ = guarded4::<()>(f, env as usize, cls as usize, mid as usize, p as usize);
-    jni_clear_exception(env);
-}
-
-pub unsafe fn jni_get_static_object_field(env: JNIEnv, cls: Jclass, fid: JfieldID) -> Jobject {
-    if cls.is_null() || fid.is_null() { return ptr::null_mut(); }
-    let f = effective_fn(env, JNI_GET_STATIC_OBJECT_FIELD);
-    let r = guarded3::<Jobject>(f, env as usize, cls as usize, fid as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_array_length(env: JNIEnv, array: Jarray) -> Jsize {
-    if array.is_null() { return 0; }
-    let f = effective_fn(env, JNI_GET_ARRAY_LENGTH);
-    let r = guarded2::<Jsize>(f, env as usize, array as usize).unwrap_or(0);
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_object_array_element(env: JNIEnv, array: Jarray, idx: Jsize) -> Jobject {
-    if array.is_null() { return ptr::null_mut(); }
-    let f = effective_fn(env, JNI_GET_OBJECT_ARRAY_ELEMENT);
-    let r = guarded3::<Jobject>(f, env as usize, array as usize, idx as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_new_string_utf(env: JNIEnv, s: &str) -> Jstring {
-    let cs = match CString::new(s) { Ok(c) => c, Err(_) => return ptr::null_mut() };
-    let f = effective_fn(env, JNI_NEW_STRING_UTF);
-    let r = guarded2::<Jstring>(f, env as usize, cs.as_ptr() as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
-pub unsafe fn jni_get_string_utf(env: JNIEnv, s: Jstring) -> Option<String> {
-    if s.is_null() { return None; }
-    let f = effective_fn(env, JNI_GET_STRING_UTF_CHARS);
-    let chars = guarded2::<*const c_char>(f, env as usize, s as usize)?;
-    if chars.is_null() { return None; }
-    let rust_str = CStr::from_ptr(chars).to_string_lossy().to_string();
-    let f_rel = effective_fn(env, JNI_RELEASE_STRING_UTF_CHARS);
-    let _ = guarded3::<()>(f_rel, env as usize, s as usize, chars as usize);
-    Some(rust_str)
-}
-
-pub unsafe fn jni_push_local_frame(env: JNIEnv, capacity: Jint) -> Jint {
-    let f = effective_fn(env, JNI_PUSH_LOCAL_FRAME);
-    guarded2::<Jint>(f, env as usize, capacity as usize).unwrap_or(-1)
-}
-
-pub unsafe fn jni_pop_local_frame(env: JNIEnv, result: Jobject) -> Jobject {
-    let f = effective_fn(env, JNI_POP_LOCAL_FRAME);
-    guarded2::<Jobject>(f, env as usize, result as usize).unwrap_or(ptr::null_mut())
-}
-
-pub unsafe fn jni_new_global_ref(env: JNIEnv, obj: Jobject) -> Jobject {
-    if obj.is_null() { return ptr::null_mut(); }
-    let f = effective_fn(env, JNI_NEW_GLOBAL_REF);
-    guarded2::<Jobject>(f, env as usize, obj as usize).unwrap_or(ptr::null_mut())
-}
-
-pub unsafe fn jni_delete_global_ref(env: JNIEnv, obj: Jobject) {
-    if obj.is_null() { return; }
-    let f = effective_fn(env, JNI_DELETE_GLOBAL_REF);
-    let _ = guarded2::<()>(f, env as usize, obj as usize);
-}
-
-pub unsafe fn jni_delete_local_ref(env: JNIEnv, obj: Jobject) {
-    if obj.is_null() { return; }
-    let f = effective_fn(env, JNI_DELETE_LOCAL_REF);
-    let _ = guarded2::<()>(f, env as usize, obj as usize);
-}
-
-pub unsafe fn jni_is_same_object(env: JNIEnv, ref1: Jobject, ref2: Jobject) -> bool {
-    let f = effective_fn(env, JNI_IS_SAME_OBJECT);
-    guarded3::<Jboolean>(f, env as usize, ref1 as usize, ref2 as usize).unwrap_or(0) != 0
-}
-
-pub unsafe fn jni_new_object_array(env: JNIEnv, len: Jsize, element_class: Jclass, initial_element: Jobject) -> Jarray {
-    let f = effective_fn(env, JNI_NEW_OBJECT_ARRAY);
-    let r = guarded4::<Jarray>(f, env as usize, len as usize, element_class as usize, initial_element as usize).unwrap_or(ptr::null_mut());
-    jni_clear_exception(env); r
-}
-
 // ══════════════════════════════════════════════════════════════════════
 // Win32 FFI
 // ══════════════════════════════════════════════════════════════════════
 
-#[repr(C)]
-struct MEMORY_BASIC_INFORMATION {
-    BaseAddress: *mut c_void,
-    AllocationBase: *mut c_void,
-    AllocationProtect: u32,
-    PartitionId: u16,
-    RegionSize: usize,
-    State: u32,
-    Protect: u32,
-    Type: u32,
-}
-
-#[repr(C)]
-struct MODULEENTRY32A {
-    dwSize: u32, th32ModuleID: u32, th32ProcessID: u32,
-    GlblcntUsage: u32, ProccntUsage: u32,
-    modBaseAddr: *mut u8, modBaseSize: u32, hModule: isize,
-    szModule: [u8; 256], szExePath: [u8; 260],
-}
-
 extern "system" {
     fn GetModuleHandleA(lpModuleName: *const u8) -> isize;
     fn GetProcAddress(hModule: isize, lpProcName: *const u8) -> Option<unsafe extern "system" fn() -> isize>;
-    fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> isize;
-    fn Module32First(hSnapshot: isize, lpme: *mut MODULEENTRY32A) -> i32;
-    fn Module32Next(hSnapshot: isize, lpme: *mut MODULEENTRY32A) -> i32;
-    fn CloseHandle(hObject: isize) -> i32;
-    fn VirtualQuery(lpAddress: *const c_void, lpBuffer: *mut MEMORY_BASIC_INFORMATION, dwLength: usize) -> usize;
     fn AddVectoredExceptionHandler(First: u32, Handler: unsafe extern "system" fn(*mut EXCEPTION_POINTERS) -> i32) -> *mut c_void;
     fn GetCurrentThreadId() -> u32;
 }
 
 type JNI_GetCreatedJavaVMs_fn = unsafe extern "system" fn(*mut JavaVM, Jsize, *mut Jsize) -> Jint;
-
-// ══════════════════════════════════════════════════════════════════════
-// PE Scan (for unlinked jvm.dll)
-// ══════════════════════════════════════════════════════════════════════
-
-unsafe fn pe_has_export(base: usize, target: &str) -> bool {
-    if base == 0 || (base & 0xFFF) != 0 { return false; }
-    if *(base as *const u16) != 0x5A4D { return false; }
-    let e_lfanew = *(base.wrapping_add(0x3C) as *const i32) as i64;
-    if e_lfanew <= 0 || e_lfanew > 0x1000 { return false; }
-    let pe = base.wrapping_add(e_lfanew as usize);
-    if *(pe as *const u32) != 0x00004550 { return false; }
-    if *(pe.wrapping_add(24) as *const u16) != 0x20B { return false; }
-    let opt = pe.wrapping_add(24);
-    let size_of_image = *(opt.wrapping_add(56) as *const u32) as usize;
-    if size_of_image < 0x1000 || size_of_image > 0x40000000 { return false; }
-    let export_rva = *(opt.wrapping_add(112) as *const u32) as usize;
-    let export_size = *(opt.wrapping_add(116) as *const u32) as usize;
-    if export_rva == 0 || export_size == 0 { return false; }
-    if export_rva.checked_add(export_size).map_or(true, |e| e > size_of_image) { return false; }
-    let exp = base.wrapping_add(export_rva);
-    let num_names = *(exp.wrapping_add(20) as *const u32) as usize;
-    let names_rva = *(exp.wrapping_add(32) as *const u32) as usize;
-    if num_names == 0 || num_names > 0x10000 { return false; }
-    if names_rva.checked_add(num_names * 4).map_or(true, |e| e > size_of_image) { return false; }
-    let names_base = base.wrapping_add(names_rva);
-    let tbytes = target.as_bytes();
-    for i in 0..num_names {
-        let name_rva = *(names_base.wrapping_add(i * 4) as *const u32) as usize;
-        if name_rva == 0 || name_rva >= size_of_image { continue; }
-        let name_ptr = base.wrapping_add(name_rva) as *const u8;
-        let mut ok = true;
-        for (j, &tb) in tbytes.iter().enumerate() {
-            let b = *name_ptr.add(j);
-            if b == 0 || b != tb { ok = false; break; }
-        }
-        if ok && *name_ptr.add(tbytes.len()) == 0 { return true; }
-    }
-    false
-}
-
-unsafe fn find_jvm_by_pe_scan() -> Option<(usize, usize)> {
-    const MEM_COMMIT: u32 = 0x1000;
-    const MEM_IMAGE: u32 = 0x1000000;
-    let mut curr: usize = 0;
-    let mut last_probe: usize = 0;
-    while curr < 0x0000_7FFF_FFFE_0000 {
-        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        let q = VirtualQuery(curr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>());
-        if q == 0 || mbi.RegionSize == 0 { break; }
-        if mbi.State == MEM_COMMIT && mbi.Type == MEM_IMAGE {
-            let probe = mbi.AllocationBase as usize;
-            if probe != 0 && probe != last_probe && (probe & 0xFFF) == 0 {
-                last_probe = probe;
-                if pe_has_export(probe, "JNI_CreateJavaVM") {
-                    let opt = probe + (*(probe.wrapping_add(0x3C) as *const i32) as usize) + 24;
-                    let soi = *(opt.wrapping_add(56) as *const u32) as usize;
-                    return Some((probe, soi));
-                }
-            }
-        }
-        curr = match curr.checked_add(mbi.RegionSize) {
-            Some(next) if next > curr => next,
-            _ => break,
-        };
-    }
-    None
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// JavaVM Scanner
-// ══════════════════════════════════════════════════════════════════════
-
-unsafe fn scan_for_javavm(jvm_base: usize, jvm_size: usize) -> JavaVM {
-    let jvm_end = jvm_base + jvm_size;
-    let code_end = jvm_base + 0x2400000;
-    let mut candidates = Vec::new();
-    let mut curr = jvm_base;
-    while curr < jvm_end {
-        let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(curr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
-            curr += 4096; continue;
-        }
-        if mbi.State != 0x1000 || (mbi.Protect & 0x101) != 0 {
-            curr = curr.saturating_add(mbi.RegionSize); continue;
-        }
-        let end = std::cmp::min(curr.saturating_add(mbi.RegionSize), jvm_end);
-        let limit = end.saturating_sub(64);
-        let mut p = (curr + 7) & !7;
-        while p < limit {
-            let e = p as *const usize;
-            if *e == 0 && *e.add(1) == 0 && *e.add(2) == 0
-                && *e.add(3) >= jvm_base && *e.add(3) < code_end
-                && *e.add(4) >= jvm_base && *e.add(4) < code_end
-                && *e.add(5) >= jvm_base && *e.add(5) < code_end
-            {
-                candidates.push(p);
-            }
-            p += 8;
-        }
-        curr = curr.saturating_add(mbi.RegionSize);
-    }
-    for &table in &candidates {
-        let mut scan = jvm_base;
-        while scan < jvm_end {
-            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            if VirtualQuery(scan as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
-                scan += 4096; continue;
-            }
-            if mbi.State == 0x1000 && (mbi.Protect & 0x0C) != 0 {
-                let end = std::cmp::min(scan.saturating_add(mbi.RegionSize), jvm_end);
-                let limit = end.saturating_sub(8);
-                let mut p = (scan + 7) & !7;
-                while p < limit {
-                    if *(p as *const usize) == table {
-                        let test_vm = p as JavaVM;
-                        let mut test_env: *mut c_void = ptr::null_mut();
-                        let iface = *test_vm;
-                        let rc = ((*iface).get_env)(test_vm, &mut test_env, JNI_VERSION_1_8);
-                        if rc == 0 || rc == -2 { return test_vm; }
-                    }
-                    p += 8;
-                }
-            }
-            scan = scan.saturating_add(mbi.RegionSize);
-        }
-    }
-    ptr::null_mut()
-}
 
 // ══════════════════════════════════════════════════════════════════════
 // Cached JNI IDs & Game Thread Resolution
@@ -865,6 +239,7 @@ unsafe fn get_all_class_loaders(env: JNIEnv) -> Vec<Jobject> {
         }
     };
 
+    log_msg("[JNI] Resolver: FindClass(java/lang/Class)");
     let cls_class = jni_find_class(env, "java/lang/Class");
     let mid_get_class_loader = if !cls_class.is_null() {
         jni_get_method_id(env, cls_class, "getClassLoader", "()Ljava/lang/ClassLoader;")
@@ -902,135 +277,24 @@ unsafe fn get_all_class_loaders(env: JNIEnv) -> Vec<Jobject> {
         }
     }
 
-    // 2. Thread.getAllStackTraces() -> Set<Thread> -> iterate all threads
+    // The attached worker can only use its own context loader and loaders
+    // obtained from known entrypoint classes. Do not enumerate every thread or
+    // request all Java stack traces during native initialization.
     let thread_cls = jni_find_class(env, "java/lang/Thread");
     if !thread_cls.is_null() {
-        let mid_get_cl = jni_get_method_id(env, thread_cls, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
-        let mid_get_name = jni_get_method_id(env, thread_cls, "getName", "()Ljava/lang/String;");
-        let mid_get_all_stacks = jni_get_static_method_id(env, thread_cls, "getAllStackTraces", "()Ljava/util/Map;");
-
-        if !mid_get_all_stacks.is_null() {
-            let map = jni_call_static_object(env, thread_cls, mid_get_all_stacks, &[]);
-            if !map.is_null() {
-                let map_cls = jni_find_class(env, "java/util/Map");
-                if !map_cls.is_null() {
-                    let mid_key_set = jni_get_method_id(env, map_cls, "keySet", "()Ljava/util/Set;");
-                    if !mid_key_set.is_null() {
-                        let set = jni_call_object(env, map, mid_key_set, &[]);
-                        if !set.is_null() {
-                            let set_cls = jni_find_class(env, "java/util/Set");
-                            if !set_cls.is_null() {
-                                let mid_to_array = jni_get_method_id(env, set_cls, "toArray", "()[Ljava/lang/Object;");
-                                if !mid_to_array.is_null() {
-                                    let arr = jni_call_object(env, set, mid_to_array, &[]);
-                                    if !arr.is_null() {
-                                        let len = jni_get_array_length(env, arr);
-                                        for i in 0..len {
-                                            let th = jni_get_object_array_element(env, arr, i);
-                                            if th.is_null() { continue; }
-
-                                            let mut th_name = String::new();
-                                            if !mid_get_name.is_null() {
-                                                let name_j = jni_call_object(env, th, mid_get_name, &[]);
-                                                if !name_j.is_null() {
-                                                    th_name = jni_get_string_utf(env, name_j).unwrap_or_default();
-                                                    jni_delete_local_ref(env, name_j);
-                                                }
-                                            }
-
-                                            // Thread contextClassLoader
-                                            if !mid_get_cl.is_null() {
-                                                let cl = jni_call_object(env, th, mid_get_cl, &[]);
-                                                if !cl.is_null() {
-                                                    add_loader(cl, &format!("thread '{}' contextClassLoader", th_name));
-                                                    jni_delete_local_ref(env, cl);
-                                                }
-                                            }
-
-                                            // Thread object classloader
-                                            let obj_cls = jni_find_class(env, "java/lang/Object");
-                                            if !obj_cls.is_null() {
-                                                let mid_get_class = jni_get_method_id(env, obj_cls, "getClass", "()Ljava/lang/Class;");
-                                                if !mid_get_class.is_null() && !mid_get_class_loader.is_null() {
-                                                    let th_c = jni_call_object(env, th, mid_get_class, &[]);
-                                                    if !th_c.is_null() {
-                                                        let th_c_loader = jni_call_object(env, th_c, mid_get_class_loader, &[]);
-                                                        if !th_c_loader.is_null() {
-                                                            add_loader(th_c_loader, &format!("thread '{}' class ClassLoader", th_name));
-                                                            jni_delete_local_ref(env, th_c_loader);
-                                                        }
-                                                        jni_delete_local_ref(env, th_c);
-                                                    }
-                                                }
-                                                jni_delete_local_ref(env, obj_cls);
-                                            }
-
-                                            jni_delete_local_ref(env, th);
-                                        }
-                                        jni_delete_local_ref(env, arr);
-                                    }
-                                }
-                                jni_delete_local_ref(env, set_cls);
-                            }
-                            jni_delete_local_ref(env, set);
-                        }
-                    }
-                    jni_delete_local_ref(env, map_cls);
+        let current = jni_get_static_method_id(env, thread_cls, "currentThread", "()Ljava/lang/Thread;");
+        let context = jni_get_method_id(env, thread_cls, "getContextClassLoader", "()Ljava/lang/ClassLoader;");
+        if !current.is_null() && !context.is_null() {
+            let thread = jni_call_static_object(env, thread_cls, current, &[]);
+            if !thread.is_null() {
+                let loader = jni_call_object(env, thread, context, &[]);
+                if !loader.is_null() {
+                    add_loader(loader, "current thread contextClassLoader");
+                    jni_delete_local_ref(env, loader);
                 }
-                jni_delete_local_ref(env, map);
+                jni_delete_local_ref(env, thread);
             }
         }
-
-        // ThreadGroup fallback
-        let tg_cls = jni_find_class(env, "java/lang/ThreadGroup");
-        if !tg_cls.is_null() {
-            let mid_cur = jni_get_static_method_id(env, thread_cls, "currentThread", "()Ljava/lang/Thread;");
-            let mid_get_tg = jni_get_method_id(env, thread_cls, "getThreadGroup", "()Ljava/lang/ThreadGroup;");
-            let mid_get_parent = jni_get_method_id(env, tg_cls, "getParent", "()Ljava/lang/ThreadGroup;");
-            let mid_active_count = jni_get_method_id(env, tg_cls, "activeCount", "()I");
-            let mid_enumerate = jni_get_method_id(env, tg_cls, "enumerate", "([Ljava/lang/Thread;)I");
-
-            if !mid_cur.is_null() && !mid_get_tg.is_null() && !mid_get_parent.is_null()
-                && !mid_active_count.is_null() && !mid_enumerate.is_null() {
-                let cur_th = jni_call_static_object(env, thread_cls, mid_cur, &[]);
-                if !cur_th.is_null() {
-                    let mut grp = jni_call_object(env, cur_th, mid_get_tg, &[]);
-                    while !grp.is_null() {
-                        let parent = jni_call_object(env, grp, mid_get_parent, &[]);
-                        if parent.is_null() { break; }
-                        jni_delete_local_ref(env, grp);
-                        grp = parent;
-                    }
-
-                    if !grp.is_null() {
-                        let active = jni_call_int(env, grp, mid_active_count, &[]);
-                        let alloc_len = ((active * 2 + 32) as i32).max(64);
-                        let threads_arr = jni_new_object_array(env, alloc_len, thread_cls, ptr::null_mut());
-                        if !threads_arr.is_null() {
-                            let args = [jvalue { l: threads_arr }];
-                            let count = jni_call_int(env, grp, mid_enumerate, &args);
-                            for i in 0..count {
-                                let th = jni_get_object_array_element(env, threads_arr, i);
-                                if th.is_null() { continue; }
-                                if !mid_get_cl.is_null() {
-                                    let cl = jni_call_object(env, th, mid_get_cl, &[]);
-                                    if !cl.is_null() {
-                                        add_loader(cl, "ThreadGroup enumerated thread contextClassLoader");
-                                        jni_delete_local_ref(env, cl);
-                                    }
-                                }
-                                jni_delete_local_ref(env, th);
-                            }
-                            jni_delete_local_ref(env, threads_arr);
-                        }
-                        jni_delete_local_ref(env, grp);
-                    }
-                    jni_delete_local_ref(env, cur_th);
-                }
-            }
-            jni_delete_local_ref(env, tg_cls);
-        }
-
         jni_delete_local_ref(env, thread_cls);
     }
 
@@ -1370,11 +634,12 @@ pub struct JniBridge {
     pub jvm_ptr: JavaVM,
     pub env_ptr: *mut c_void,
     cached_ids: Option<CachedIds>,
+    owner_thread: Option<std::thread::ThreadId>,
+    owns_attachment: bool,
     mc_instance: Jobject, // cached Minecraft singleton
 }
 
-unsafe impl Send for JniBridge {}
-unsafe impl Sync for JniBridge {}
+// Raw JVM handles are deliberately not Send or Sync: JNIEnv is thread-local.
 
 impl Default for JniBridge {
     fn default() -> Self { Self::new() }
@@ -1387,139 +652,109 @@ impl JniBridge {
             jvm_ptr: ptr::null_mut(),
             env_ptr: ptr::null_mut(),
             cached_ids: None,
+            owner_thread: None,
+            owns_attachment: false,
             mc_instance: ptr::null_mut(),
         }
     }
 
     pub fn env(&self) -> JNIEnv {
+        if self.owner_thread != Some(std::thread::current().id()) {
+            return ptr::null_mut();
+        }
         self.env_ptr as JNIEnv
+    }
+
+    fn detach_owned_thread(&mut self) {
+        if self.owner_thread != Some(std::thread::current().id()) { return; }
+        if self.owns_attachment && !self.jvm_ptr.is_null() {
+            unsafe { ((*(*self.jvm_ptr)).detach_current_thread)(self.jvm_ptr); }
+        }
+        self.is_connected = false;
+        self.owns_attachment = false;
+        self.owner_thread = None;
+        self.env_ptr = ptr::null_mut();
+        self.jvm_ptr = ptr::null_mut();
     }
 
     #[cfg(target_os = "windows")]
     pub fn attach_to_game_process(&mut self) -> Result<(), &'static str> {
         unsafe {
-            install_veh();
-
-            // Find jvm.dll
-            let mut jvm_handle: isize = 0;
-            let mut jvm_size: usize = 0;
-
-            // Method 1: Toolhelp32
-            let snap = CreateToolhelp32Snapshot(0x00000008, 0);
-            if snap != -1 {
-                let mut me: MODULEENTRY32A = std::mem::zeroed();
-                me.dwSize = std::mem::size_of::<MODULEENTRY32A>() as u32;
-                if Module32First(snap, &mut me) != 0 {
-                    loop {
-                        let name = CStr::from_ptr(me.szModule.as_ptr() as *const c_char).to_string_lossy().to_lowercase();
-                        if name == "jvm.dll" {
-                            jvm_handle = me.hModule;
-                            jvm_size = me.modBaseSize as usize;
-                            break;
-                        }
-                        if Module32Next(snap, &mut me) == 0 { break; }
-                    }
-                }
-                CloseHandle(snap);
+            if self.is_connected {
+                return if self.env().is_null() { Err("JNIEnv belongs to another thread") } else { Ok(()) };
             }
-
-            // Method 2: GetModuleHandleA
-            if jvm_handle == 0 {
-                let n = CString::new("jvm.dll").unwrap();
-                jvm_handle = GetModuleHandleA(n.as_ptr() as *const u8);
-                jvm_size = 0x2400000;
+            // Only the standard exported Invocation API may supply a JavaVM.
+            // Guessing one from arbitrary memory can accept a false vtable.
+            let jvm_handle = GetModuleHandleA(b"jvm.dll\0".as_ptr());
+            if jvm_handle == 0 { return Err("jvm.dll unavailable through standard loader API; initialization stopped"); }
+            let proc = GetProcAddress(jvm_handle, b"JNI_GetCreatedJavaVMs\0".as_ptr())
+                .ok_or("JNI_GetCreatedJavaVMs unavailable; memory-scan fallback disabled")?;
+            let get_vms: JNI_GetCreatedJavaVMs_fn = std::mem::transmute(proc);
+            let mut vms: [JavaVM; 2] = [ptr::null_mut(); 2];
+            let mut count: Jsize = 0;
+            let rc = get_vms(vms.as_mut_ptr(), 2, &mut count);
+            if rc != JNI_OK || count != 1 || vms[0].is_null() {
+                log_msg(&format!("[JNI] GetCreatedJavaVMs rejected: rc={} count={}", rc, count));
+                return Err("Standard Invocation API did not return exactly one JavaVM");
             }
-
-            // Method 3: PE export scan (Astraea unlinks jvm.dll from PEB)
-            if jvm_handle == 0 {
-                if let Some((base, size)) = find_jvm_by_pe_scan() {
-                    jvm_handle = base as isize;
-                    jvm_size = size;
-                    log_msg(&format!("[JNI] jvm.dll recovered via PE scan @ 0x{:X}", base));
-                }
-            }
-
-            if jvm_handle == 0 {
-                return Err("jvm.dll not found");
-            }
-
-            G_JVM_BASE = jvm_handle as usize;
-            G_JVM_SIZE = if jvm_size != 0 { jvm_size } else { 0x2400000 };
-            log_msg(&format!("[JNI] jvm.dll base=0x{:X} size=0x{:X}", *(&raw const G_JVM_BASE), *(&raw const G_JVM_SIZE)));
-
-            // Get JavaVM
-            let mut vm: JavaVM = ptr::null_mut();
-            let fn_name = CString::new("JNI_GetCreatedJavaVMs").unwrap();
-            if let Some(proc_addr) = GetProcAddress(jvm_handle, fn_name.as_ptr() as *const u8) {
-                let get_vms: JNI_GetCreatedJavaVMs_fn = std::mem::transmute(proc_addr);
-                let mut vms: [JavaVM; 4] = [ptr::null_mut(); 4];
-                let mut count: Jsize = 0;
-                let rc = get_vms(vms.as_mut_ptr(), 4, &mut count);
-                if rc == JNI_OK && count > 0 && !vms[0].is_null() {
-                    vm = vms[0];
-                    log_msg(&format!("[JNI] GetCreatedJavaVMs: {} VMs", count));
-                }
-            }
-
-            if vm.is_null() {
-                vm = scan_for_javavm(jvm_handle as usize, jvm_size);
-                if !vm.is_null() {
-                    log_msg(&format!("[JNI] VM recovered via memory scan @ 0x{:X}", vm as usize));
-                }
-            }
-
-            if vm.is_null() {
-                return Err("Could not locate JavaVM");
-            }
-
-            G_JAVAVM = vm;
-
-            // Attach thread
-            let thread_name = CString::new("VibeClientThread").unwrap();
-            let mut attach_args = JavaVMAttachArgs {
-                version: JNI_VERSION_1_8,
-                name: thread_name.as_ptr(),
-                group: ptr::null_mut(),
-            };
-
+            let vm = vms[0];
             let iface = *vm;
+            if iface.is_null() { return Err("JavaVM has no Invocation API table"); }
             let mut env: *mut c_void = ptr::null_mut();
-
             let rc = ((*iface).get_env)(vm, &mut env, JNI_VERSION_1_8);
-            if rc != 0 || env.is_null() {
-                let rc = ((*iface).attach_current_thread)(vm, &mut env, ptr::null_mut());
-                if rc != 0 || env.is_null() {
-                    let rc = ((*iface).attach_current_thread_as_daemon)(vm, &mut env, &mut attach_args as *mut _ as *mut c_void);
-                    if rc != 0 || env.is_null() {
-                        return Err("Failed to attach to JVM");
-                    }
-                }
+            let mut owns_attachment = false;
+            match rc {
+                JNI_OK if !env.is_null() => {},
+                JNI_EDETACHED => { // not an unsupported-version/other error
+                    let thread_name = CString::new("VibeClientThread").unwrap();
+                    let mut args = JavaVMAttachArgs {
+                        version: JNI_VERSION_1_8, name: thread_name.as_ptr(), group: ptr::null_mut(),
+                    };
+                    let rc = ((*iface).attach_current_thread_as_daemon)(
+                        vm, &mut env, &mut args as *mut _ as *mut c_void,
+                    );
+                    if rc != JNI_OK { return Err("AttachCurrentThreadAsDaemon failed"); }
+                    owns_attachment = true;
+                },
+                _ => return Err("GetEnv failed; attachment not attempted for this error"),
             }
-
-            // Verify env with GetEnv
-            let mut env2: *mut c_void = ptr::null_mut();
-            let rc2 = ((*iface).get_env)(vm, &mut env2, JNI_VERSION_1_8);
-            if rc2 == 0 && !env2.is_null() && env2 as usize != env as usize {
-                env = env2;
+            let mut verified: *mut c_void = ptr::null_mut();
+            let rc = ((*iface).get_env)(vm, &mut verified, JNI_VERSION_1_8);
+            if rc != JNI_OK || env.is_null() || verified != env {
+                if owns_attachment { ((*iface).detach_current_thread)(vm); }
+                return Err("GetEnv could not verify the attached thread's JNIEnv");
             }
-
             self.jvm_ptr = vm;
             self.env_ptr = env;
-            self.is_connected = true;
-
-            log_msg(&format!("[JNI] Attached! env=0x{:X}", env as usize));
-
-            // Resolve cached IDs
+            self.owner_thread = Some(std::thread::current().id());
+            self.owns_attachment = owns_attachment;
             let e = self.env();
-            match CachedIds::resolve(e) {
-                Some(ids) => {
-                    log_msg("[JNI] All class/field/method IDs resolved successfully");
-                    self.cached_ids = Some(ids);
-                }
-                None => {
-                    log_msg("[JNI] WARNING: Could not resolve some IDs — game state reading will be limited");
-                }
+            log_msg(&format!("[JNI] Attached using standard Invocation API; env=0x{:X}", env as usize));
+            log_msg("[JNI] Bootstrap: GetVersion");
+            let version = jni_get_version(e);
+            if version < JNI_VERSION_1_8 {
+                self.detach_owned_thread();
+                return Err("JNI GetVersion returned an unsupported version");
             }
+            log_msg("[JNI] Bootstrap: FindClass(java/lang/Object)");
+            let object = jni_find_class(e, "java/lang/Object");
+            if object.is_null() {
+                self.detach_owned_thread();
+                return Err("Standard FindClass bootstrap probe failed");
+            }
+            jni_delete_local_ref(e, object);
+            if jni_push_local_frame(e, 256) != JNI_OK {
+                self.detach_owned_thread();
+                return Err("PushLocalFrame failed during initialization");
+            }
+            log_msg("[JNI] Bootstrap: resolve game class/field/method IDs");
+            self.cached_ids = CachedIds::resolve(e);
+            if self.cached_ids.is_none() {
+                jni_pop_local_frame(e, ptr::null_mut());
+                self.detach_owned_thread();
+                return Err("Game IDs unavailable through standard JNI; initialization stopped");
+            }
+            log_msg("[JNI] All class/field/method IDs resolved successfully");
 
             // Cache Minecraft singleton
             if let Some(ref ids) = self.cached_ids {
@@ -1560,6 +795,9 @@ impl JniBridge {
                 }
             }
 
+            jni_pop_local_frame(e, ptr::null_mut());
+            self.is_connected = true;
+            G_JAVAVM = vm;
             Ok(())
         }
     }
@@ -1848,16 +1086,8 @@ impl JniBridge {
         }
     }
 
-    pub fn detach(&mut self) {
-        if self.is_connected && !self.jvm_ptr.is_null() {
-            unsafe {
-                let vm_table = *self.jvm_ptr;
-                ((*vm_table).detach_current_thread)(self.jvm_ptr);
-            }
-            self.is_connected = false;
-            self.env_ptr = ptr::null_mut();
-        }
-    }
+    pub fn detach(&mut self) { self.detach_owned_thread(); }
+
 }
 
 impl Drop for JniBridge {

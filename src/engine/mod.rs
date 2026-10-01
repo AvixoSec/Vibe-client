@@ -6,3 +6,4 @@ pub mod input;
 pub mod action_executor;
 pub mod frame_exchange;
 pub mod diagnostics;
+pub mod jni_api;

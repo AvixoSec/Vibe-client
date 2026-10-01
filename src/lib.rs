@@ -170,10 +170,10 @@ unsafe fn client_main() {
     // Wait for Astraea to finish its init hooks
     std::thread::sleep(std::time::Duration::from_millis(2500));
 
-    jni_bridge::log_msg("=== Vibe Client v0.1.0 starting ===");
-
-    // Install VEH handler for crash-proof JNI
-    jni_bridge::install_veh();
+    jni_bridge::log_msg(&format!(
+        "=== Vibe Client v0.1.0 JNI-safe starting | pid={} thread={:?} ===",
+        std::process::id(), std::thread::current().id(),
+    ));
 
     // Create client
     let mut client = VibeClient::new();
@@ -192,6 +192,9 @@ unsafe fn client_main() {
             }
         }
     }
+
+    // The legacy render guard is only needed after standard JNI bootstrap.
+    jni_bridge::install_veh();
 
     // Install render hook
     if render_hook::install_hook() {
