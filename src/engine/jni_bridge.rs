@@ -7,9 +7,6 @@
 //! game-state reading from MCP 1.12.2 obfuscated classes.
 
 use std::ffi::{c_char, c_void, CStr, CString};
-use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
 use std::ptr;
 
 use crate::core::snapshot::*;
@@ -1360,14 +1357,8 @@ unsafe fn try_method(env: JNIEnv, cls: Jclass, pairs: &[(&str, &str)]) -> Option
 // Logger
 // ══════════════════════════════════════════════════════════════════════
 
-const LOG_DIR: &str = r"d:\project\rustme\dump";
-
 pub fn log_msg(msg: &str) {
-    let log_path = PathBuf::from(LOG_DIR).join("client.log");
-    let _ = fs::create_dir_all(LOG_DIR);
-    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-        writeln!(f, "{}", msg).ok();
-    }
+    crate::engine::diagnostics::log_msg(msg);
 }
 
 // ══════════════════════════════════════════════════════════════════════
