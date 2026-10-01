@@ -21,25 +21,26 @@ fn main() {
         extern "system" {
             fn LoadLibraryA(lpLibFileName: *const u8) -> isize;
             fn GetProcAddress(hModule: isize, lpProcName: *const u8) -> *const u8;
+            fn FreeLibrary(hModule: isize) -> i32;
         }
         let gl = LoadLibraryA(b"opengl32.dll\0".as_ptr());
         if gl != 0 {
             let p = GetProcAddress(gl, b"wglSwapBuffers\0".as_ptr());
             if !p.is_null() {
-                let slice = std::slice::from_raw_parts(p, 64);
-                println!("  -> opengl32!wglSwapBuffers bytes: {:02X?}", slice);
-                let disp = i32::from_le_bytes(slice[10..14].try_into().unwrap()) as isize;
-                let target = (p as usize + 14).wrapping_add(disp as usize);
-                println!("  -> target = 0x{:X}, target value = 0x{:X}", target, *(target as *const usize));
+                // Export addresses are useful diagnostics. Decoding arbitrary
+                // prologue bytes as a displacement and dereferencing the result
+                // is not safe across Windows builds/drivers.
+                println!("  -> opengl32!wglSwapBuffers address: {:p}", p);
             }
+            FreeLibrary(gl);
         }
         let gdi = LoadLibraryA(b"gdi32.dll\0".as_ptr());
         if gdi != 0 {
             let p = GetProcAddress(gdi, b"SwapBuffers\0".as_ptr());
             if !p.is_null() {
-                let slice = std::slice::from_raw_parts(p, 32);
-                println!("  -> gdi32!SwapBuffers bytes: {:02X?}", slice);
+                println!("  -> gdi32!SwapBuffers address: {:p}", p);
             }
+            FreeLibrary(gdi);
         }
     }
 

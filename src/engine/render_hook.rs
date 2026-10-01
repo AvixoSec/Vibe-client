@@ -2,7 +2,7 @@
 //! OpenGL overlay renderer — hooks wglSwapBuffers to draw the cheat UI.
 
 use std::ffi::{c_void, CString};
-use std::sync::Mutex;
+use crate::engine::frame_exchange::LatestFrame;
 
 use crate::engine::renderer::DrawCommand;
 
@@ -65,10 +65,7 @@ static mut HOOK_INSTALLED: bool = false;
 static mut ORIGINAL_WGL_SWAP: usize = 0;
 static mut ORIGINAL_BYTES: [u8; 14] = [0; 14]; // for x64 hook
 
-pub static RENDER_COMMANDS: Mutex<RenderBuffer> = Mutex::new(RenderBuffer {
-    commands: Vec::new(),
-    strings: Vec::new(),
-});
+pub static RENDER_COMMANDS: LatestFrame<RenderBuffer> = LatestFrame::new();
 
 pub static VIEWPORT_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1920);
 pub static VIEWPORT_HEIGHT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1080);
@@ -83,6 +80,7 @@ extern "system" {
     fn GetProcAddress(hModule: isize, lpProcName: *const u8) -> Option<unsafe extern "system" fn() -> isize>;
     fn VirtualProtect(addr: *mut c_void, size: usize, new_protect: u32, old_protect: *mut u32) -> i32;
     fn VirtualAlloc(addr: *mut c_void, size: usize, alloc_type: u32, protect: u32) -> *mut c_void;
+    fn VirtualFree(addr: *mut c_void, size: usize, free_type: u32) -> i32;
     fn GetCurrentProcess() -> isize;
     fn FlushInstructionCache(hProcess: isize, lpBaseAddress: *const c_void, dwSize: usize) -> i32;
 }
@@ -200,14 +198,14 @@ unsafe fn render_overlay() {
     VIEWPORT_WIDTH.store(viewport[2] as u32, std::sync::atomic::Ordering::Relaxed);
     VIEWPORT_HEIGHT.store(viewport[3] as u32, std::sync::atomic::Ordering::Relaxed);
 
-    // Lock and clone the command buffer (try_lock to avoid blocking game thread)
-    let (commands, strings) = {
-        let lock = match RENDER_COMMANDS.try_lock() {
-            Ok(l) => l,
-            Err(_) => return,
-        };
-        (lock.commands.clone(), lock.strings.clone())
+    // Clone only an Arc. The lock is released before any OpenGL calls, and
+    // commands and strings always belong to the same immutable frame.
+    let frame = match RENDER_COMMANDS.try_snapshot() {
+        Some(frame) => frame,
+        None => return,
     };
+    let commands = &frame.commands;
+    let strings = &frame.strings;
     if commands.is_empty() { return; }
 
     // Save and unbind modern OpenGL pipeline state to avoid conflicts in AMD/NVIDIA drivers
@@ -245,7 +243,7 @@ unsafe fn render_overlay() {
     (gl.glBlendFunc)(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     // Draw commands
-    for cmd in &commands {
+    for cmd in commands {
         match cmd {
             DrawCommand::Rect { min, max, color } => {
                 (gl.glColor4f)(color.r, color.g, color.b, color.a);
@@ -393,8 +391,18 @@ pub unsafe fn install_hook() -> bool {
     // Check if already hooked (starts with jmp [rip+0]: FF 25)
     if swap_bytes[0] == 0xFF && swap_bytes[1] == 0x25 {
         crate::engine::jni_bridge::log_msg("[RENDER] wglSwapBuffers is already hooked, skipping installation");
-        HOOK_INSTALLED = true;
-        return true;
+        // This is somebody else's hook. We have no original function pointer.
+        return false;
+    }
+
+    // This implementation only knows how to relocate this exact prologue.
+    // Never blindly copy 14 arbitrary bytes: that may split an instruction or
+    // relocate an unsupported relative operand. Disable the overlay instead.
+    if swap_bytes[..7] != [0x40, 0x55, 0x57, 0x48, 0x83, 0xEC, 0x58]
+        || swap_bytes[7..10] != [0x48, 0x8B, 0x05]
+    {
+        crate::engine::jni_bridge::log_msg("[RENDER] Unsupported wglSwapBuffers prologue; overlay not installed");
+        return false;
     }
 
     // Allocate trampoline buffer (executable)
@@ -429,7 +437,7 @@ pub unsafe fn install_hook() -> bool {
         let t = (trampoline as usize + 7) as *mut u8;
         *t = 0x48;
         *t.add(1) = 0xB8;
-        *(t.add(2) as *mut u64) = target_var as u64;
+        std::ptr::write_unaligned(t.add(2) as *mut u64, target_var as u64);
         *t.add(10) = 0x48;
         *t.add(11) = 0x8B;
         *t.add(12) = 0x00;
@@ -444,23 +452,29 @@ pub unsafe fn install_hook() -> bool {
     let tramp_jmp = (trampoline as usize + tramp_len) as *mut u8;
     *tramp_jmp = 0xFF;
     *tramp_jmp.add(1) = 0x25;
-    *(tramp_jmp.add(2) as *mut u32) = 0;
-    *(tramp_jmp.add(6) as *mut u64) = ret_addr as u64;
+    std::ptr::write_unaligned(tramp_jmp.add(2) as *mut u32, 0);
+    std::ptr::write_unaligned(tramp_jmp.add(6) as *mut u64, ret_addr as u64);
 
     let tramp_addr = trampoline as usize;
-    ORIGINAL_WGL_SWAP = tramp_addr;
 
     // Overwrite wglSwapBuffers entry with JMP to our hook: FF 25 00 00 00 00 <hooked_wgl_swap_buffers>
     let mut old_protect: u32 = 0;
-    VirtualProtect(swap_addr as *mut c_void, 14, 0x40, &mut old_protect);
+    if VirtualProtect(swap_addr as *mut c_void, 14, 0x40, &mut old_protect) == 0 {
+        VirtualFree(trampoline, 0, 0x8000); // MEM_RELEASE
+        crate::engine::jni_bridge::log_msg("[RENDER] Could not change page protection; overlay not installed");
+        return false;
+    }
+    ORIGINAL_WGL_SWAP = tramp_addr;
 
     let hook_target = swap_addr as *mut u8;
     *hook_target = 0xFF;
     *hook_target.add(1) = 0x25;
-    *(hook_target.add(2) as *mut u32) = 0;
-    *(hook_target.add(6) as *mut u64) = hooked_wgl_swap_buffers as *const () as u64;
+    std::ptr::write_unaligned(hook_target.add(2) as *mut u32, 0);
+    std::ptr::write_unaligned(hook_target.add(6) as *mut u64, hooked_wgl_swap_buffers as *const () as u64);
 
-    VirtualProtect(swap_addr as *mut c_void, 14, old_protect, &mut old_protect);
+    if VirtualProtect(swap_addr as *mut c_void, 14, old_protect, &mut old_protect) == 0 {
+        crate::engine::jni_bridge::log_msg("[RENDER] WARNING: could not restore page protection");
+    }
 
     let cur_proc = GetCurrentProcess();
     FlushInstructionCache(cur_proc, swap_addr as *const c_void, 14);
@@ -476,10 +490,10 @@ pub unsafe fn install_hook() -> bool {
 
 /// Submit a frame of draw commands for the render hook to display.
 pub fn submit_frame(commands: &[DrawCommand], strings: &[String]) {
-    if let Ok(mut lock) = RENDER_COMMANDS.lock() {
-        lock.commands.clear();
-        lock.commands.extend_from_slice(commands);
-        lock.strings.clear();
-        lock.strings.extend_from_slice(strings);
-    }
+    // One copy per submitted logic frame, not one deep copy per display frame.
+    // Construct the entire frame before taking the publication lock.
+    RENDER_COMMANDS.publish(RenderBuffer {
+        commands: commands.to_vec(),
+        strings: strings.to_vec(),
+    });
 }
