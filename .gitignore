@@ -1,0 +1,17 @@
+# Rust build artifacts
+target/
+**/target/
+
+# Dumps and unpacked JDK
+dump/
+tools/temurin21/
+
+# Logs
+*.log
+**/*.log
+
+# OS / IDE
+.idea/
+.vscode/
+*.user
+Thumbs.db

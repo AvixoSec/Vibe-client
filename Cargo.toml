@@ -1,0 +1,39 @@
+[package]
+name = "vibe_rm_client"
+version = "0.1.0"
+edition = "2021"
+authors = ["Avixo"]
+description = "High-performance modular client for RustMe (Vanilla 1.12.2 / LWJGL 3.3.3 / Java 21)"
+
+[lib]
+name = "vibe_client"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "vibe_runner"
+path = "src/main.rs"
+
+[[bin]]
+name = "vibe_injector"
+path = "src/injector.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Memory",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Console",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
